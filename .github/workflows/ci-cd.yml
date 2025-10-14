@@ -24,7 +24,7 @@ on:
 
 env:
   AWS_REGION: us-east-2
-  # Default/fallback (will be overridden per env by the Resolve step)
+  # Fallback if account-id secrets are absent (still overridden by STS below)
   AWS_ACCOUNT_ID: 327019199684
   ECR_REPO: fintech-app
 
@@ -75,12 +75,22 @@ jobs:
           fi
           echo "image-tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve Environment Config
+      # Moved up so STS is available to resolve account ID if secrets are missing
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve Environment Config (with STS fallback)
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
           ENV="${{ github.event.inputs.environment || 'prod' }}"
+
+          # Prefer per-env secrets if present
           case "$ENV" in
             dev)  ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID_DEV }}";;
             qa)   ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID_QA }}";;
@@ -88,18 +98,28 @@ jobs:
             prod) ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID_PROD }}";;
             *) echo "Unknown environment: $ENV"; exit 1;;
           esac
+
+          # Fallback to STS (requires AWS creds configured above)
           if [ -z "${ACCOUNT_ID:-}" ]; then
-            echo "No AWS Account ID secret set for ENV=$ENV"; exit 1
+            echo "No per-env AWS Account ID secret set for ENV=$ENV. Falling back to STS…"
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text || true)"
           fi
+
+          # Final fallback to env var if STS failed (e.g., offline)
+          if [ -z "${ACCOUNT_ID:-}" ]; then
+            ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
+          fi
+
+          # Validate we have a 12-digit account ID
+          if ! [[ "${ACCOUNT_ID:-}" =~ ^[0-9]{12}$ ]]; then
+            echo "❌ Could not determine a valid AWS Account ID for ENV=$ENV."
+            echo "   Set secrets AWS_ACCOUNT_ID_${ENV^^} or ensure AWS creds are valid for STS."
+            exit 1
+          fi
+
           echo "env-name=$ENV" >> "$GITHUB_OUTPUT"
           echo "account-id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          echo "Resolved AWS Account ID: $ACCOUNT_ID"
 
       - name: Login to AWS ECR
         run: |
@@ -151,12 +171,20 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      - name: Resolve Environment Config
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve Environment Config (with STS fallback)
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
           ENV="${{ github.event.inputs.environment || 'prod' }}"
+
           case "$ENV" in
             dev)  ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID_DEV }}";;
             qa)   ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID_QA }}";;
@@ -164,11 +192,24 @@ jobs:
             prod) ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID_PROD }}";;
             *) echo "Unknown environment: $ENV"; exit 1;;
           esac
+
           if [ -z "${ACCOUNT_ID:-}" ]; then
-            echo "No AWS Account ID secret set for ENV=$ENV"; exit 1
+            echo "No per-env AWS Account ID secret set for ENV=$ENV. Falling back to STS…"
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text || true)"
           fi
+
+          if [ -z "${ACCOUNT_ID:-}" ]; then
+            ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
+          fi
+
+          if ! [[ "${ACCOUNT_ID:-}" =~ ^[0-9]{12}$ ]]; then
+            echo "❌ Could not determine a valid AWS Account ID for ENV=$ENV."
+            exit 1
+          fi
+
           echo "env-name=$ENV" >> "$GITHUB_OUTPUT"
           echo "account-id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved AWS Account ID: $ACCOUNT_ID"
 
       - name: Notify Slack (🚀 Starting Deployment)
         run: |
@@ -199,7 +240,6 @@ jobs:
           kubectl apply -k ./eks_addons/monitoring
           kubectl apply -k ./eks_addons/elk
 
-      # --- Key step: Patch overlay file with correct Account ID + Tag ---
       - name: Update overlay image reference
         run: |
           set -euo pipefail
@@ -210,7 +250,6 @@ jobs:
           REPO="$ECR_REPO"
           IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO:$IMAGE_TAG"
 
-          # Locate patch-deployment.yaml in common layouts
           FILE=""
           for p in "./k8s/overlays/$ENV/patch-deployment.yaml" \
                    "./fintech-app/k8s/overlays/$ENV/patch-deployment.yaml" \
@@ -224,7 +263,6 @@ jobs:
           fi
 
           echo "🔧 Patching $FILE with image: $IMAGE_URI"
-          # Replace the entire image: line regardless of current account/tag
           perl -0777 -pe "s|image:\s*[\w\.\-]+\.dkr\.ecr\.[\w-]+\.amazonaws\.com/[\w\.\-]+:[\w\.\-]+|image: $IMAGE_URI|g" -i "$FILE"
 
           echo "✅ Updated image line:"
